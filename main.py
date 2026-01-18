@@ -1,25 +1,28 @@
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware  # <-- YENİ EKLENEN KISIM
 from pydantic import BaseModel
 import ephem
 import math
 import os
 import httpx
 from dotenv import load_dotenv
-from pathlib import Path
 
-# --- 1. AYARLAR ---
-current_dir = Path(__file__).parent
-env_path = current_dir / ".env"
-load_dotenv(dotenv_path=env_path)
-
+# --- AYARLAR ---
+load_dotenv()
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 
-if not GOOGLE_API_KEY:
-    raise ValueError("KRİTİK HATA: .env dosyası okunamadı!")
+app = FastAPI(title="AstroRoast API")
 
-app = FastAPI(title="AstroRoast API", description="Auto-Model Detection Edition")
+# --- 🔥 CORS İZNİ (TARAYICI ENGELİNİ KALDIRIR) ---
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Her yerden gelen isteği kabul et
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# --- 2. VERİ MODELİ ---
+# --- VERİ MODELİ ---
 class UserRequest(BaseModel):
     date: str
     time: str
@@ -27,7 +30,7 @@ class UserRequest(BaseModel):
     city_lon: str
     mode: str
 
-# --- 3. ASTROLOJİ MOTORU ---
+# --- ASTROLOJİ MOTORU ---
 def get_zodiac_sign(lon_rad):
     lon_deg = math.degrees(lon_rad)
     signs = ["Koç", "Boğa", "İkizler", "Yengeç", "Aslan", "Başak", 
@@ -37,10 +40,14 @@ def get_zodiac_sign(lon_rad):
 
 def calculate_chart_ephem(date, time, lat, lon):
     try:
+        # Tarih formatını düzelt (1991/07/20 -> 1991/7/20) ephem bazen sıfırları sevmez
+        date_parts = date.replace("-", "/").split("/")
+        formatted_date = f"{int(date_parts[0])}/{int(date_parts[1])}/{int(date_parts[2])}"
+        
         observer = ephem.Observer()
         observer.lat = lat
         observer.lon = lon
-        observer.date = f"{date} {time}"
+        observer.date = f"{formatted_date} {time}"
         
         sun = ephem.Sun(observer)
         moon = ephem.Moon(observer)
@@ -58,88 +65,46 @@ def calculate_chart_ephem(date, time, lat, lon):
     except Exception as e:
         return {"error": str(e)}
 
-# --- 4. AKILLI MODEL SEÇİCİ (YENİ ÖZELLİK) ---
+# --- GEMINI MODEL SEÇİCİ ---
 async def get_working_model(client):
-    """Google'a sorar: Hangi modellerim açık? İlk çalışanı seçer."""
     url = f"https://generativelanguage.googleapis.com/v1beta/models?key={GOOGLE_API_KEY}"
     try:
         response = await client.get(url)
         data = response.json()
-        
-        if "error" in data:
-            return None, f"Liste Hatası: {data['error']['message']}"
-            
-        # Modelleri tara, 'generateContent' yapabilen ilkini bul
         for model in data.get("models", []):
             if "generateContent" in model.get("supportedGenerationMethods", []):
-                # Genellikle 'models/gemini-pro' veya 'models/gemini-1.5-flash' döner
-                print(f"✅ ÇALIŞAN MODEL BULUNDU: {model['name']}") # Terminalde görelim
                 return model['name'], None
-                
-        return None, "Hiçbir uygun model bulunamadı."
-    except Exception as e:
-        return None, str(e)
+        return "models/gemini-pro", None # Yedek
+    except:
+        return "models/gemini-pro", None
 
-# --- 5. GEMINI İSTEĞİ ---
-async def generate_roast_direct(astro_data, mode):
-    
-    async with httpx.AsyncClient() as client:
-        # Önce çalışan modeli bul
-        model_name, error = await get_working_model(client)
-        if error:
-            return f"Model Bulunamadı: {error}"
-
-        # Bulunan modeli kullan
-        url = f"https://generativelanguage.googleapis.com/v1beta/{model_name}:generateContent?key={GOOGLE_API_KEY}"
-        
-        if mode == "fake_nice":
-            prompt_text = f"""
-            Rol: 90'ların aşırı kurumsal ama bozuk 'Müşteri Hizmetleri' botusun.
-            Ton: Vıcık vıcık kibar ama parantez (...) içinde iğneleyici gerçekler söylüyorsun.
-            Kullanıcı Verileri: Güneş {astro_data['sun']}, Ay {astro_data['moon']}, Merkür {astro_data['mercury']}, Mars {astro_data['mars']}, Satürn {astro_data['saturn']}.
-            Görev: Bu kişiye 2-3 cümlelik astrolojik yorum yap.
-            """
-        else:
-            prompt_text = f"""
-            Rol: Hatalı çalışan, acımasız ve alaycı bir yapay zekasın.
-            Ton: Sert, aşağılayıcı, 'ERROR' şakaları yapan.
-            Kullanıcı Verileri: Güneş {astro_data['sun']}, Ay {astro_data['moon']}, Merkür {astro_data['mercury']}, Mars {astro_data['mars']}, Satürn {astro_data['saturn']}.
-            Görev: Bu kişiyi burçlarına göre aşağıla (Roast et). Asla teselli verme.
-            """
-
-        payload = {
-            "contents": [{"parts": [{"text": prompt_text}]}],
-            "safetySettings": [
-                {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-                {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
-            ]
-        }
-
-        try:
-            response = await client.post(url, json=payload, timeout=30.0)
-            data = response.json()
-            
-            if "candidates" in data and data["candidates"]:
-                return data["candidates"][0]["content"]["parts"][0]["text"]
-            else:
-                return f"Google Cevap Vermedi: {data}"
-        except Exception as e:
-            return f"Bağlantı Hatası: {str(e)}"
-
-# --- 6. API ENDPOINT ---
+# --- API ENDPOINT ---
 @app.post("/analyze")
 async def analyze_user(request: UserRequest):
     chart_data = calculate_chart_ephem(request.date, request.time, request.city_lat, request.city_lon)
     
     if "error" in chart_data:
-        raise HTTPException(status_code=400, detail=f"Hesaplama Hatası: {chart_data['error']}")
+         # Hata olsa bile JSON dön ki uygulama çökmesin
+        return {"roast_message": f"Hesaplama Hatası: {chart_data['error']}. Tarih formatını kontrol et."}
 
-    ai_response = await generate_roast_direct(chart_data, request.mode)
-    
-    return {
-        "engine": "Google Gemini (Auto-Detect)",
-        "astro_data": chart_data,
-        "roast_message": ai_response
-    }
+    async with httpx.AsyncClient() as client:
+        model_name, _ = await get_working_model(client)
+        url = f"https://generativelanguage.googleapis.com/v1beta/{model_name}:generateContent?key={GOOGLE_API_KEY}"
+        
+        prompt_text = f"""
+        Rol: Acımasız, alaycı ve komik bir astrolog yapay zekasın.
+        Kullanıcı Verileri: Güneş {chart_data['sun']}, Ay {chart_data['moon']}, Merkür {chart_data['mercury']}, Mars {chart_data['mars']}, Satürn {chart_data['saturn']}.
+        Görev: Bu kişiyi burçlarına göre aşağıla (Roast et). Kısa ve vurucu olsun.
+        """
+
+        payload = {"contents": [{"parts": [{"text": prompt_text}]}]}
+        
+        try:
+            response = await client.post(url, json=payload, timeout=60.0)
+            data = response.json()
+            if "candidates" in data:
+                return {"roast_message": data["candidates"][0]["content"]["parts"][0]["text"]}
+            else:
+                return {"roast_message": "Yapay zeka sessiz kaldı. Tekrar dene."}
+        except Exception as e:
+            return {"roast_message": f"Bağlantı Hatası: {str(e)}"}
